@@ -14,6 +14,15 @@ CTrade trade;
 CPositionInfo position;
 CAccountInfo account;
 
+int g_atr_handle = INVALID_HANDLE;
+int g_rsi_handle = INVALID_HANDLE;
+int g_ema_fast_h1_handle = INVALID_HANDLE;
+int g_ema_slow_h1_handle = INVALID_HANDLE;
+int g_sma_slow_h1_handle = INVALID_HANDLE;
+int g_ema_fast_h4_handle = INVALID_HANDLE;
+int g_ema_slow_h4_handle = INVALID_HANDLE;
+int g_sma_slow_h4_handle = INVALID_HANDLE;
+
 //--- Inputs
 input string InpSymbolLock             = "XAUUSD";     // Symbol lock (prefix)
 input ENUM_TIMEFRAMES InpExecTF        = PERIOD_M5;    // Execution timeframe (M1-M15)
@@ -52,6 +61,7 @@ input int    InpNewYorkEndHourGMT      = 21;           // New York session end (
 input bool   InpUseNewsFilter          = true;         // Use economic calendar filter
 input int    InpNewsPauseBeforeMin     = 30;           // Pause before news (min)
 input int    InpNewsPauseAfterMin      = 30;           // Pause after news (min)
+input string InpNewsSchedule           = "";           // News schedule list (YYYY.MM.DD HH:MI;...)
 
 input string InpTelegramToken          = "";           // Telegram bot token
 input string InpTelegramChatId         = "";           // Telegram chat id
@@ -111,24 +121,25 @@ bool NewsOK(datetime &next_news_time)
    if(!InpUseNewsFilter)
       return true;
 
-   // Economic calendar filter (requires MT5 with calendar access).
-   datetime now = TimeCurrent();
+   if(StringLen(InpNewsSchedule) == 0)
+      return true;
 
-   // Scan for upcoming high-impact USD events.
-   MqlCalendarValue values[];
-   int count = CalendarValueHistory(values, now - 3600, now + 86400);
+   string items[];
+   int count = StringSplit(InpNewsSchedule, ';', items);
    if(count <= 0)
       return true;
 
+   datetime now = TimeCurrent();
    for(int i = 0; i < count; i++)
    {
-      MqlCalendarValue v = values[i];
-      if(v.currency != "USD")
-         continue;
-      if(v.importance < CALENDAR_IMPORTANCE_HIGH)
+      string trimmed = TrimString(items[i]);
+      if(StringLen(trimmed) == 0)
          continue;
 
-      datetime event_time = v.time;
+      datetime event_time = StringToTime(trimmed);
+      if(event_time <= 0)
+         continue;
+
       datetime pause_from = event_time - (InpNewsPauseBeforeMin * 60);
       datetime pause_to = event_time + (InpNewsPauseAfterMin * 60);
 
@@ -142,15 +153,38 @@ bool NewsOK(datetime &next_news_time)
    return true;
 }
 
+string TrimString(string value)
+{
+   StringTrimLeft(value);
+   StringTrimRight(value);
+   return value;
+}
+
+bool CopyLatestValue(const int handle, double &value)
+{
+   double buffer[];
+   if(CopyBuffer(handle, 0, 0, 1, buffer) < 1)
+      return false;
+   value = buffer[0];
+   return true;
+}
+
 bool TrendAligned(bool &bullish)
 {
-   double ema_fast_h1 = iMA(Symbol(), InpTrendTF1, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE, 0);
-   double ema_slow_h1 = iMA(Symbol(), InpTrendTF1, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE, 0);
-   double sma_slow_h1 = iMA(Symbol(), InpTrendTF1, InpSMASlow, 0, MODE_SMA, PRICE_CLOSE, 0);
+   double ema_fast_h1;
+   double ema_slow_h1;
+   double sma_slow_h1;
+   double ema_fast_h4;
+   double ema_slow_h4;
+   double sma_slow_h4;
 
-   double ema_fast_h4 = iMA(Symbol(), InpTrendTF2, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE, 0);
-   double ema_slow_h4 = iMA(Symbol(), InpTrendTF2, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE, 0);
-   double sma_slow_h4 = iMA(Symbol(), InpTrendTF2, InpSMASlow, 0, MODE_SMA, PRICE_CLOSE, 0);
+   if(!CopyLatestValue(g_ema_fast_h1_handle, ema_fast_h1) ||
+      !CopyLatestValue(g_ema_slow_h1_handle, ema_slow_h1) ||
+      !CopyLatestValue(g_sma_slow_h1_handle, sma_slow_h1) ||
+      !CopyLatestValue(g_ema_fast_h4_handle, ema_fast_h4) ||
+      !CopyLatestValue(g_ema_slow_h4_handle, ema_slow_h4) ||
+      !CopyLatestValue(g_sma_slow_h4_handle, sma_slow_h4))
+      return false;
 
    bool bull_h1 = (ema_fast_h1 > ema_slow_h1 && ema_slow_h1 > sma_slow_h1);
    bool bull_h4 = (ema_fast_h4 > ema_slow_h4 && ema_slow_h4 > sma_slow_h4);
@@ -172,13 +206,16 @@ bool TrendAligned(bool &bullish)
 
 bool VolatilityOK(double &atr_value)
 {
-   atr_value = iATR(Symbol(), InpExecTF, InpATRPeriod, 0);
+   if(!CopyLatestValue(g_atr_handle, atr_value))
+      return false;
    return (atr_value >= InpATRMin && atr_value <= InpATRMax);
 }
 
 bool MomentumOK(bool bullish)
 {
-   double rsi = iRSI(Symbol(), InpExecTF, InpRSIPeriod, PRICE_CLOSE, 0);
+   double rsi;
+   if(!CopyLatestValue(g_rsi_handle, rsi))
+      return false;
    if(bullish)
       return rsi >= InpRSIBuy;
    return rsi <= InpRSISell;
@@ -250,9 +287,19 @@ bool DailyDrawdownOK()
    return true;
 }
 
+datetime CurrentDayStart()
+{
+   MqlDateTime tm;
+   TimeToStruct(TimeCurrent(), tm);
+   tm.hour = 0;
+   tm.min = 0;
+   tm.sec = 0;
+   return StructToTime(tm);
+}
+
 void ResetDailyTracking()
 {
-   g_day_start = Date();
+   g_day_start = CurrentDayStart();
    g_day_start_equity = account.Equity();
 }
 
@@ -306,6 +353,56 @@ int OnInit()
       return INIT_FAILED;
    }
 
+   if(InpUseNewsFilter && StringLen(InpNewsSchedule) == 0)
+   {
+      Print("News filter enabled but no schedule provided.");
+      SendTelegram("News filter enabled but no schedule provided.");
+   }
+
+   g_atr_handle = iATR(Symbol(), InpExecTF, InpATRPeriod);
+   if(g_atr_handle == INVALID_HANDLE)
+   {
+      Print("Failed to create ATR handle.");
+      return INIT_FAILED;
+   }
+
+   g_rsi_handle = iRSI(Symbol(), InpExecTF, InpRSIPeriod, PRICE_CLOSE);
+   if(g_rsi_handle == INVALID_HANDLE)
+   {
+      Print("Failed to create RSI handle.");
+      IndicatorRelease(g_atr_handle);
+      return INIT_FAILED;
+   }
+
+   g_ema_fast_h1_handle = iMA(Symbol(), InpTrendTF1, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+   g_ema_slow_h1_handle = iMA(Symbol(), InpTrendTF1, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+   g_sma_slow_h1_handle = iMA(Symbol(), InpTrendTF1, InpSMASlow, 0, MODE_SMA, PRICE_CLOSE);
+   g_ema_fast_h4_handle = iMA(Symbol(), InpTrendTF2, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+   g_ema_slow_h4_handle = iMA(Symbol(), InpTrendTF2, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+   g_sma_slow_h4_handle = iMA(Symbol(), InpTrendTF2, InpSMASlow, 0, MODE_SMA, PRICE_CLOSE);
+
+   if(g_ema_fast_h1_handle == INVALID_HANDLE || g_ema_slow_h1_handle == INVALID_HANDLE ||
+      g_sma_slow_h1_handle == INVALID_HANDLE || g_ema_fast_h4_handle == INVALID_HANDLE ||
+      g_ema_slow_h4_handle == INVALID_HANDLE || g_sma_slow_h4_handle == INVALID_HANDLE)
+   {
+      Print("Failed to create MA handles.");
+      IndicatorRelease(g_atr_handle);
+      IndicatorRelease(g_rsi_handle);
+      if(g_ema_fast_h1_handle != INVALID_HANDLE)
+         IndicatorRelease(g_ema_fast_h1_handle);
+      if(g_ema_slow_h1_handle != INVALID_HANDLE)
+         IndicatorRelease(g_ema_slow_h1_handle);
+      if(g_sma_slow_h1_handle != INVALID_HANDLE)
+         IndicatorRelease(g_sma_slow_h1_handle);
+      if(g_ema_fast_h4_handle != INVALID_HANDLE)
+         IndicatorRelease(g_ema_fast_h4_handle);
+      if(g_ema_slow_h4_handle != INVALID_HANDLE)
+         IndicatorRelease(g_ema_slow_h4_handle);
+      if(g_sma_slow_h4_handle != INVALID_HANDLE)
+         IndicatorRelease(g_sma_slow_h4_handle);
+      return INIT_FAILED;
+   }
+
    ResetDailyTracking();
    EventSetTimer(60);
    return INIT_SUCCEEDED;
@@ -317,6 +414,22 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   if(g_atr_handle != INVALID_HANDLE)
+      IndicatorRelease(g_atr_handle);
+   if(g_rsi_handle != INVALID_HANDLE)
+      IndicatorRelease(g_rsi_handle);
+   if(g_ema_fast_h1_handle != INVALID_HANDLE)
+      IndicatorRelease(g_ema_fast_h1_handle);
+   if(g_ema_slow_h1_handle != INVALID_HANDLE)
+      IndicatorRelease(g_ema_slow_h1_handle);
+   if(g_sma_slow_h1_handle != INVALID_HANDLE)
+      IndicatorRelease(g_sma_slow_h1_handle);
+   if(g_ema_fast_h4_handle != INVALID_HANDLE)
+      IndicatorRelease(g_ema_fast_h4_handle);
+   if(g_ema_slow_h4_handle != INVALID_HANDLE)
+      IndicatorRelease(g_ema_slow_h4_handle);
+   if(g_sma_slow_h4_handle != INVALID_HANDLE)
+      IndicatorRelease(g_sma_slow_h4_handle);
 }
 
 //+------------------------------------------------------------------+
@@ -324,7 +437,7 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTimer()
 {
-   datetime today = Date();
+   datetime today = CurrentDayStart();
    if(today != g_day_start)
    {
       SendDailySummary();
@@ -339,13 +452,20 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result)
 {
-   if(trans.type == TRADE_TRANSACTION_DEAL_ADD && trans.deal_type == DEAL_TYPE_SELL ||
-      trans.deal_type == DEAL_TYPE_BUY)
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD &&
+      (trans.deal_type == DEAL_TYPE_SELL || trans.deal_type == DEAL_TYPE_BUY))
    {
-      if(trans.entry == DEAL_ENTRY_OUT)
+      if(trans.deal > 0)
       {
+         long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+         if(entry != DEAL_ENTRY_OUT)
+            return;
+
+         string deal_symbol = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
+         double deal_price = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+         double deal_profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
          string msg = StringFormat("Exit %s at %.2f, P/L=%.2f",
-                                   trans.symbol, trans.price, trans.profit);
+                                   deal_symbol, deal_price, deal_profit);
          SendTelegram(msg);
       }
    }
