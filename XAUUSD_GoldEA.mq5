@@ -1,561 +1,430 @@
 //+------------------------------------------------------------------+
 //|                                                XAUUSD_GoldEA.mq5 |
-//|              XAUUSD-only Expert Advisor (MT5, production spec)  |
+//|   XAUUSD-only Expert Advisor (MT5) - Trend+Pullback+ATR Risk      |
 //+------------------------------------------------------------------+
-#property copyright ""
-#property version   "1.00"
 #property strict
+#property version "1.10"
 
 #include <Trade/Trade.mqh>
-#include <Trade/PositionInfo.mqh>
-#include <Trade/AccountInfo.mqh>
 
 CTrade trade;
-CPositionInfo position;
-CAccountInfo account;
 
-int g_atr_handle = INVALID_HANDLE;
-int g_rsi_handle = INVALID_HANDLE;
-int g_ema_fast_h1_handle = INVALID_HANDLE;
-int g_ema_slow_h1_handle = INVALID_HANDLE;
-int g_sma_slow_h1_handle = INVALID_HANDLE;
-int g_ema_fast_h4_handle = INVALID_HANDLE;
-int g_ema_slow_h4_handle = INVALID_HANDLE;
-int g_sma_slow_h4_handle = INVALID_HANDLE;
+//------------------------- Inputs ----------------------------------//
+input string           InpSymbolLock          = "XAUUSD";     // Symbol prefix lock (supports suffix)
+input ENUM_TIMEFRAMES  InpExecTF              = PERIOD_M5;    // Execution timeframe
+input ENUM_TIMEFRAMES  InpTrendTF1            = PERIOD_H1;    // Trend TF 1
+input ENUM_TIMEFRAMES  InpTrendTF2            = PERIOD_H4;    // Trend TF 2
 
-//--- Inputs
-input string InpSymbolLock             = "XAUUSD";     // Symbol lock (prefix)
-input ENUM_TIMEFRAMES InpExecTF        = PERIOD_M5;    // Execution timeframe (M1-M15)
-input ENUM_TIMEFRAMES InpTrendTF1      = PERIOD_H1;    // Trend TF 1
-input ENUM_TIMEFRAMES InpTrendTF2      = PERIOD_H4;    // Trend TF 2
+input int              InpEMAFast             = 20;           // EMA fast
+input int              InpEMASlow             = 50;           // EMA slow
+input int              InpSMASlow             = 100;          // SMA slow
 
-input int    InpEMAFast                = 20;           // EMA fast
-input int    InpEMASlow                = 50;           // EMA slow
-input int    InpSMASlow                = 100;          // SMA slow
+input int              InpRSIPeriod           = 14;           // RSI period (Exec TF)
+input double           InpRSILongMin          = 52.0;         // RSI threshold for longs
+input double           InpRSIShortMax         = 48.0;         // RSI threshold for shorts
 
-input int    InpATRPeriod              = 14;           // ATR period
-input double InpATRMin                 = 0.50;         // Min ATR filter (gold tuned)
-input double InpATRMax                 = 8.00;         // Max ATR filter (gold tuned)
-input double InpATRSLMult              = 1.2;          // SL ATR multiplier
-input double InpATRTPMult              = 1.5;          // TP ATR multiplier
+input int              InpATRPeriod           = 14;           // ATR period (Exec TF)
+input double           InpATRMin              = 0.0;          // Min ATR filter (0 disables)
+input double           InpATRMax              = 0.0;          // Max ATR filter (0 disables)
 
-input int    InpRSIPeriod              = 14;           // RSI period
-input double InpRSIBuy                 = 55.0;         // RSI buy threshold
-input double InpRSISell                = 45.0;         // RSI sell threshold
+input double           InpSL_ATR_Mult         = 1.5;          // StopLoss = ATR * mult
+input double           InpTP_R_Mult           = 1.4;          // TakeProfit = SL * R-mult
 
-input int    InpStructureLookback      = 5;            // Breakout lookback
+input double           InpRiskPercent         = 0.50;         // Risk per trade (% of equity)
+input int              InpMaxTradesPerDay     = 6;            // Max trades per day
+input double           InpDailyLossLimitPct   = 2.0;          // Stop trading for day if equity drops this % from day start
 
-input double InpMaxLossPerTradeUSD     = 20.0;         // Hard max loss per trade
-input double InpMinTakeProfitUSD       = 20.01;        // Min TP in USD
-input double InpMaxDailyDrawdownUSD    = 200.0;        // Daily max drawdown
+input int              InpMaxSpreadPoints     = 60;           // Max spread (points) allowed
+input long             InpMagic               = 20251225;     // Magic number
+input bool             InpVerboseLogs         = true;         // Print decision logs
 
-input int    InpMaxSpreadPoints        = 250;          // Max spread (points)
-input int    InpMaxSlippagePoints      = 50;           // Max slippage (points)
+//------------------------- Globals ---------------------------------//
+int hATR = INVALID_HANDLE;
+int hRSI = INVALID_HANDLE;
 
-input bool   InpUseSessionFilter       = true;         // Use session filter
-input int    InpLondonStartHourGMT     = 7;            // London session start (GMT)
-input int    InpLondonEndHourGMT       = 16;           // London session end (GMT)
-input int    InpNewYorkStartHourGMT    = 12;           // New York session start (GMT)
-input int    InpNewYorkEndHourGMT      = 21;           // New York session end (GMT)
+int hEmaFast_TF1 = INVALID_HANDLE;
+int hEmaSlow_TF1 = INVALID_HANDLE;
+int hSmaSlow_TF1 = INVALID_HANDLE;
 
-input bool   InpUseNewsFilter          = true;         // Use economic calendar filter
-input int    InpNewsPauseBeforeMin     = 30;           // Pause before news (min)
-input int    InpNewsPauseAfterMin      = 30;           // Pause after news (min)
-input string InpNewsSchedule           = "";           // News schedule list (YYYY.MM.DD HH:MI;...)
+int hEmaFast_TF2 = INVALID_HANDLE;
+int hEmaSlow_TF2 = INVALID_HANDLE;
+int hSmaSlow_TF2 = INVALID_HANDLE;
 
-input string InpTelegramToken          = "";           // Telegram bot token
-input string InpTelegramChatId         = "";           // Telegram chat id
+datetime g_lastBarTime = 0;
 
-//--- State
-bool   g_trading_enabled = true;
-datetime g_day_start = 0;
-double g_day_start_equity = 0.0;
-int    g_last_summary_day = -1;
+// daily tracking
+int      g_dayKey = -1;           // yyyymmdd
+double   g_dayStartEquity = 0.0;
+int      g_tradesToday = 0;
 
-//+------------------------------------------------------------------+
-//| Helpers                                                         |
-//+------------------------------------------------------------------+
-bool IsSymbolAllowed()
+//------------------------- Utilities --------------------------------//
+bool SymbolMatchesLock()
 {
-   string sym = Symbol();
-   if(StringLen(sym) < StringLen(InpSymbolLock))
-      return false;
-   return StringFind(sym, InpSymbolLock, 0) == 0;
+   // allow suffixes: "XAUUSD", "XAUUSDm", "XAUUSD.i"
+   return (StringFind(_Symbol, InpSymbolLock) == 0);
 }
 
-bool IsExecutionTF()
+int MakeDayKey(datetime t)
 {
-   return (InpExecTF == PERIOD_M1 || InpExecTF == PERIOD_M5 || InpExecTF == PERIOD_M15);
+   MqlDateTime s; TimeToStruct(t, s);
+   return (s.year * 10000 + s.mon * 100 + s.day);
 }
 
-bool SpreadOK()
+void ResetDailyIfNeeded()
 {
-   long spread = (long)SymbolInfoInteger(Symbol(), SYMBOL_SPREAD);
-   return spread > 0 && spread <= InpMaxSpreadPoints;
-}
-
-bool SlippageOK()
-{
-   // Slippage enforced on order send; this is a placeholder for logic extension.
-   return true;
-}
-
-bool SessionOK()
-{
-   if(!InpUseSessionFilter)
-      return true;
-
-   datetime gmt = TimeGMT();
-   MqlDateTime tm;
-   TimeToStruct(gmt, tm);
-
-   bool in_london = (tm.hour >= InpLondonStartHourGMT && tm.hour < InpLondonEndHourGMT);
-   bool in_ny = (tm.hour >= InpNewYorkStartHourGMT && tm.hour < InpNewYorkEndHourGMT);
-
-   return (in_london || in_ny);
-}
-
-bool NewsOK(datetime &next_news_time)
-{
-   next_news_time = 0;
-   if(!InpUseNewsFilter)
-      return true;
-
-   if(StringLen(InpNewsSchedule) == 0)
-      return true;
-
-   string items[];
-   int count = StringSplit(InpNewsSchedule, ';', items);
-   if(count <= 0)
-      return true;
-
-   datetime now = TimeCurrent();
-   for(int i = 0; i < count; i++)
+   int dk = MakeDayKey(TimeCurrent());
+   if(dk != g_dayKey)
    {
-      string trimmed = TrimString(items[i]);
-      if(StringLen(trimmed) == 0)
-         continue;
+      g_dayKey = dk;
+      g_dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      g_tradesToday = 0;
+      if(InpVerboseLogs)
+         Print("Daily reset: dayKey=", g_dayKey, " dayStartEquity=", DoubleToString(g_dayStartEquity, 2));
+   }
+}
 
-      datetime event_time = StringToTime(trimmed);
-      if(event_time <= 0)
-         continue;
+bool DailyLimitsOk()
+{
+   ResetDailyIfNeeded();
 
-      datetime pause_from = event_time - (InpNewsPauseBeforeMin * 60);
-      datetime pause_to = event_time + (InpNewsPauseAfterMin * 60);
+   if(InpMaxTradesPerDay > 0 && g_tradesToday >= InpMaxTradesPerDay)
+   {
+      if(InpVerboseLogs) Print("Daily limit hit: tradesToday=", g_tradesToday, " max=", InpMaxTradesPerDay);
+      return false;
+   }
 
-      if(now >= pause_from && now <= pause_to)
+   if(InpDailyLossLimitPct > 0.0 && g_dayStartEquity > 0.0)
+   {
+      double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+      double ddPct = 100.0 * (g_dayStartEquity - eq) / g_dayStartEquity;
+      if(ddPct >= InpDailyLossLimitPct)
       {
-         next_news_time = event_time;
+         if(InpVerboseLogs)
+            Print("Daily loss limit hit: ddPct=", DoubleToString(ddPct, 2), "% limit=", DoubleToString(InpDailyLossLimitPct,2), "%");
          return false;
       }
    }
-
    return true;
 }
 
-string TrimString(string value)
+bool SpreadOk()
 {
-   StringTrimLeft(value);
-   StringTrimRight(value);
-   return value;
-}
-
-bool CopyLatestValue(const int handle, double &value)
-{
-   double buffer[];
-   if(CopyBuffer(handle, 0, 0, 1, buffer) < 1)
-      return false;
-   value = buffer[0];
-   return true;
-}
-
-bool TrendAligned(bool &bullish)
-{
-   double ema_fast_h1;
-   double ema_slow_h1;
-   double sma_slow_h1;
-   double ema_fast_h4;
-   double ema_slow_h4;
-   double sma_slow_h4;
-
-   if(!CopyLatestValue(g_ema_fast_h1_handle, ema_fast_h1) ||
-      !CopyLatestValue(g_ema_slow_h1_handle, ema_slow_h1) ||
-      !CopyLatestValue(g_sma_slow_h1_handle, sma_slow_h1) ||
-      !CopyLatestValue(g_ema_fast_h4_handle, ema_fast_h4) ||
-      !CopyLatestValue(g_ema_slow_h4_handle, ema_slow_h4) ||
-      !CopyLatestValue(g_sma_slow_h4_handle, sma_slow_h4))
-      return false;
-
-   bool bull_h1 = (ema_fast_h1 > ema_slow_h1 && ema_slow_h1 > sma_slow_h1);
-   bool bull_h4 = (ema_fast_h4 > ema_slow_h4 && ema_slow_h4 > sma_slow_h4);
-   bool bear_h1 = (ema_fast_h1 < ema_slow_h1 && ema_slow_h1 < sma_slow_h1);
-   bool bear_h4 = (ema_fast_h4 < ema_slow_h4 && ema_slow_h4 < sma_slow_h4);
-
-   if(bull_h1 && bull_h4)
+   int spreadPoints = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   if(InpMaxSpreadPoints > 0 && spreadPoints > InpMaxSpreadPoints)
    {
-      bullish = true;
-      return true;
+      if(InpVerboseLogs) Print("Spread filter: spreadPoints=", spreadPoints, " > max=", InpMaxSpreadPoints);
+      return false;
    }
-   if(bear_h1 && bear_h4)
+   return true;
+}
+
+bool Copy1(int handle, double &val, int shift=0)
+{
+   double buf[];
+   ArraySetAsSeries(buf, true);
+   if(CopyBuffer(handle, 0, shift, 1, buf) != 1)
+      return false;
+   val = buf[0];
+   return true;
+}
+
+bool Copy2(int handle, double &val0, double &val1)
+{
+   // shift 0 and 1
+   double buf[];
+   ArraySetAsSeries(buf, true);
+   if(CopyBuffer(handle, 0, 0, 2, buf) != 2)
+      return false;
+   val0 = buf[0];
+   val1 = buf[1];
+   return true;
+}
+
+bool IsNewBar()
+{
+   datetime t = iTime(_Symbol, InpExecTF, 0);
+   if(t == 0) return false;
+   if(t != g_lastBarTime)
    {
-      bullish = false;
+      g_lastBarTime = t;
       return true;
    }
    return false;
 }
 
-bool VolatilityOK(double &atr_value)
-{
-   if(!CopyLatestValue(g_atr_handle, atr_value))
-      return false;
-   return (atr_value >= InpATRMin && atr_value <= InpATRMax);
-}
-
-bool MomentumOK(bool bullish)
-{
-   double rsi;
-   if(!CopyLatestValue(g_rsi_handle, rsi))
-      return false;
-   if(bullish)
-      return rsi >= InpRSIBuy;
-   return rsi <= InpRSISell;
-}
-
-bool PriceActionOK(bool bullish)
-{
-   MqlRates rates[];
-   if(CopyRates(Symbol(), InpExecTF, 0, 3, rates) < 3)
-      return false;
-
-   // Simple engulfing
-   bool bull_engulf = (rates[1].close < rates[1].open && rates[0].close > rates[0].open &&
-                       rates[0].close > rates[1].open && rates[0].open < rates[1].close);
-   bool bear_engulf = (rates[1].close > rates[1].open && rates[0].close < rates[0].open &&
-                       rates[0].close < rates[1].open && rates[0].open > rates[1].close);
-
-   // Breakout
-   double highest = rates[1].high;
-   double lowest = rates[1].low;
-   for(int i = 1; i <= InpStructureLookback && i < ArraySize(rates); i++)
-   {
-      highest = MathMax(highest, rates[i].high);
-      lowest = MathMin(lowest, rates[i].low);
-   }
-   bool bull_break = rates[0].close > highest;
-   bool bear_break = rates[0].close < lowest;
-
-   if(bullish)
-      return bull_engulf || bull_break;
-   return bear_engulf || bear_break;
-}
-
 bool HasOpenPosition()
 {
-   return position.Select(Symbol());
+   // One position per symbol+magic
+   int total = PositionsTotal();
+   for(int idx = total - 1; idx >= 0; --idx)
+   {
+      ulong ticket = PositionGetTicket(idx);
+      if(ticket == 0) continue;
+
+      if(!PositionSelectByTicket(ticket)) continue;
+
+      string sym = PositionGetString(POSITION_SYMBOL);
+      long magic = (long)PositionGetInteger(POSITION_MAGIC);
+
+      if(sym == _Symbol && magic == InpMagic)
+         return true;
+   }
+   return false;
 }
 
-double CalcLot(double sl_points)
+double NormalizeVolume(double vol)
 {
-   double tick_value = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_VALUE);
-   double tick_size = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_SIZE);
-   double point_value = tick_value / tick_size;
+   double vMin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double vMax  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double vStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
 
-   if(sl_points <= 0.0 || point_value <= 0.0)
-      return 0.0;
+   if(vol < vMin) vol = vMin;
+   if(vol > vMax) vol = vMax;
 
-   double lot = InpMaxLossPerTradeUSD / (sl_points * point_value);
-
-   double min_lot = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN);
-   double max_lot = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MAX);
-   double step = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP);
-
-   lot = MathMax(min_lot, MathMin(lot, max_lot));
-   lot = MathFloor(lot / step) * step;
-
-   return lot;
+   // round down to step
+   double steps = MathFloor(vol / vStep);
+   double out = steps * vStep;
+   // ensure not below min after rounding
+   if(out < vMin) out = vMin;
+   return out;
 }
 
-bool DailyDrawdownOK()
+double CalcLotsByRisk(double sl_points)
 {
-   if(g_day_start_equity <= 0.0)
-      return true;
+   if(sl_points <= 0) return 0.0;
 
-   double dd = g_day_start_equity - account.Equity();
-   if(dd >= InpMaxDailyDrawdownUSD)
-      return false;
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskMoney = equity * (InpRiskPercent / 100.0);
+   if(riskMoney <= 0) return 0.0;
 
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double point     = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+   if(tickValue <= 0 || tickSize <= 0 || point <= 0) return 0.0;
+
+   // value per point for 1.0 lot:
+   // 1 point = point price movement
+   // value per point = tickValue * (point / tickSize)
+   double valuePerPointPerLot = tickValue * (point / tickSize);
+   if(valuePerPointPerLot <= 0) return 0.0;
+
+   double lots = riskMoney / (sl_points * valuePerPointPerLot);
+   return NormalizeVolume(lots);
+}
+
+//------------------------- Strategy logic ---------------------------//
+bool TrendLong()
+{
+   double efast1, eslow1, ssma1;
+   double efast2, eslow2, ssma2;
+
+   if(!Copy1(hEmaFast_TF1, efast1) || !Copy1(hEmaSlow_TF1, eslow1) || !Copy1(hSmaSlow_TF1, ssma1)) return false;
+   if(!Copy1(hEmaFast_TF2, efast2) || !Copy1(hEmaSlow_TF2, eslow2) || !Copy1(hSmaSlow_TF2, ssma2)) return false;
+
+   return (efast1 > eslow1 && eslow1 > ssma1) && (efast2 > eslow2 && eslow2 > ssma2);
+}
+
+bool TrendShort()
+{
+   double efast1, eslow1, ssma1;
+   double efast2, eslow2, ssma2;
+
+   if(!Copy1(hEmaFast_TF1, efast1) || !Copy1(hEmaSlow_TF1, eslow1) || !Copy1(hSmaSlow_TF1, ssma1)) return false;
+   if(!Copy1(hEmaFast_TF2, efast2) || !Copy1(hEmaSlow_TF2, eslow2) || !Copy1(hSmaSlow_TF2, ssma2)) return false;
+
+   return (efast1 < eslow1 && eslow1 < ssma1) && (efast2 < eslow2 && eslow2 < ssma2);
+}
+
+bool AtrOk(double atr)
+{
+   if(InpATRMin > 0.0 && atr < InpATRMin) return false;
+   if(InpATRMax > 0.0 && atr > InpATRMax) return false;
    return true;
 }
 
-datetime CurrentDayStart()
+void TryEnter()
 {
-   MqlDateTime tm;
-   TimeToStruct(TimeCurrent(), tm);
-   tm.hour = 0;
-   tm.min = 0;
-   tm.sec = 0;
-   return StructToTime(tm);
-}
+   if(!DailyLimitsOk()) return;
+   if(!SpreadOk()) return;
+   if(HasOpenPosition())
+   {
+      if(InpVerboseLogs) Print("Skip: already in position.");
+      return;
+   }
 
-void ResetDailyTracking()
-{
-   g_day_start = CurrentDayStart();
-   g_day_start_equity = account.Equity();
-}
+   // Read ATR/RSI on ExecTF
+   double atr=0.0, rsi=0.0;
+   if(!Copy1(hATR, atr) || !Copy1(hRSI, rsi))
+   {
+      if(InpVerboseLogs) Print("Indicator read failed (ATR/RSI). err=", GetLastError());
+      return;
+   }
+   if(!AtrOk(atr))
+   {
+      if(InpVerboseLogs) Print("ATR filter blocked. ATR=", DoubleToString(atr, Digits()));
+      return;
+   }
 
-void SendTelegram(const string &message)
-{
-   if(StringLen(InpTelegramToken) == 0 || StringLen(InpTelegramChatId) == 0)
+   // Pullback-to-EMA20 entry conditions on ExecTF
+   double emaFast0=0.0, emaFast1=0.0;
+   int hEmaFastExec = iMA(_Symbol, InpExecTF, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+   if(hEmaFastExec == INVALID_HANDLE)
+   {
+      if(InpVerboseLogs) Print("Failed to create temp Exec EMA handle.");
+      return;
+   }
+   if(!Copy2(hEmaFastExec, emaFast0, emaFast1))
+   {
+      IndicatorRelease(hEmaFastExec);
+      if(InpVerboseLogs) Print("Failed to read Exec EMA.");
+      return;
+   }
+   IndicatorRelease(hEmaFastExec);
+
+   double close1 = iClose(_Symbol, InpExecTF, 1);
+   double low1   = iLow(_Symbol, InpExecTF, 1);
+   double high1  = iHigh(_Symbol, InpExecTF, 1);
+
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+
+   // SL/TP distance from ATR
+   double sl_price_dist = atr * InpSL_ATR_Mult;
+   if(sl_price_dist <= 0) return;
+
+   double sl_points = sl_price_dist / point;
+   double lots = CalcLotsByRisk(sl_points);
+   if(lots <= 0)
+   {
+      if(InpVerboseLogs) Print("Lot calc produced 0. Check symbol properties / risk settings.");
+      return;
+   }
+
+   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetDeviationInPoints(30);
+
+   // Long setup
+   bool wantLongTrend = TrendLong();
+   bool pullbackLong  = (low1 <= emaFast1) && (close1 > emaFast1) && (rsi >= InpRSILongMin);
+
+   // Short setup
+   bool wantShortTrend = TrendShort();
+   bool pullbackShort  = (high1 >= emaFast1) && (close1 < emaFast1) && (rsi <= InpRSIShortMax);
+
+   if(InpVerboseLogs)
+   {
+      Print("Decision: ATR=", DoubleToString(atr, Digits()),
+            " RSI=", DoubleToString(rsi, 2),
+            " trendL=", (wantLongTrend?"Y":"N"),
+            " pbL=", (pullbackLong?"Y":"N"),
+            " trendS=", (wantShortTrend?"Y":"N"),
+            " pbS=", (pullbackShort?"Y":"N"),
+            " lots=", DoubleToString(lots, 2));
+   }
+
+   if(!( (wantLongTrend && pullbackLong) || (wantShortTrend && pullbackShort) ))
       return;
 
-   string url = "https://api.telegram.org/bot" + InpTelegramToken + "/sendMessage";
-   string data = "chat_id=" + InpTelegramChatId + "&text=" + message;
+   // Prices
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-   char post[];
-   StringToCharArray(data, post);
-
-   char result[];
-   string headers;
-
-   ResetLastError();
-   int res = WebRequest("POST", url, "", 5000, post, result, headers);
-   if(res == -1)
+   if(wantLongTrend && pullbackLong)
    {
-      Print("Telegram error: ", GetLastError());
+      double sl = ask - sl_price_dist;
+      double tp = ask + (sl_price_dist * InpTP_R_Mult);
+
+      if(trade.Buy(lots, _Symbol, ask, sl, tp, "TrendPullback-L"))
+      {
+         g_tradesToday++;
+         if(InpVerboseLogs) Print("BUY placed. lots=", lots, " SL=", DoubleToString(sl, Digits()), " TP=", DoubleToString(tp, Digits()));
+      }
+      else
+      {
+         if(InpVerboseLogs) Print("BUY failed. ret=", trade.ResultRetcode(), " err=", GetLastError());
+      }
+      return;
+   }
+
+   if(wantShortTrend && pullbackShort)
+   {
+      double sl = bid + sl_price_dist;
+      double tp = bid - (sl_price_dist * InpTP_R_Mult);
+
+      if(trade.Sell(lots, _Symbol, bid, sl, tp, "TrendPullback-S"))
+      {
+         g_tradesToday++;
+         if(InpVerboseLogs) Print("SELL placed. lots=", lots, " SL=", DoubleToString(sl, Digits()), " TP=", DoubleToString(tp, Digits()));
+      }
+      else
+      {
+         if(InpVerboseLogs) Print("SELL failed. ret=", trade.ResultRetcode(), " err=", GetLastError());
+      }
+      return;
    }
 }
 
-void SendDailySummary()
-{
-   double equity = account.Equity();
-   double pnl = equity - g_day_start_equity;
-   string msg = StringFormat("Daily summary: trades=%d, PnL=%.2f", 
-                             (int)HistoryDealsTotal(), pnl);
-   SendTelegram(msg);
-}
-
-//+------------------------------------------------------------------+
-//| Expert initialization function                                   |
-//+------------------------------------------------------------------+
+//------------------------- MT5 Events --------------------------------//
 int OnInit()
 {
-   if(!IsSymbolAllowed())
+   if(!SymbolMatchesLock())
    {
-      Print("XAUUSD-only EA. Symbol rejected: ", Symbol());
-      SendTelegram("EA refused to start: symbol is not XAUUSD.");
+      Print("This EA is locked to symbol prefix: ", InpSymbolLock, " but chart is: ", _Symbol);
       return INIT_FAILED;
    }
 
-   if(!IsExecutionTF())
+   if(Period() != InpExecTF)
+      Print("Note: Chart TF is ", Period(), " but EA ExecTF is ", InpExecTF, ". It will still work using iTime/iClose on ExecTF.");
+
+   // Create indicator handles
+   hATR = iATR(_Symbol, InpExecTF, InpATRPeriod);
+   hRSI = iRSI(_Symbol, InpExecTF, InpRSIPeriod, PRICE_CLOSE);
+
+   hEmaFast_TF1 = iMA(_Symbol, InpTrendTF1, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+   hEmaSlow_TF1 = iMA(_Symbol, InpTrendTF1, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+   hSmaSlow_TF1 = iMA(_Symbol, InpTrendTF1, InpSMASlow, 0, MODE_SMA, PRICE_CLOSE);
+
+   hEmaFast_TF2 = iMA(_Symbol, InpTrendTF2, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+   hEmaSlow_TF2 = iMA(_Symbol, InpTrendTF2, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+   hSmaSlow_TF2 = iMA(_Symbol, InpTrendTF2, InpSMASlow, 0, MODE_SMA, PRICE_CLOSE);
+
+   if(hATR==INVALID_HANDLE || hRSI==INVALID_HANDLE ||
+      hEmaFast_TF1==INVALID_HANDLE || hEmaSlow_TF1==INVALID_HANDLE || hSmaSlow_TF1==INVALID_HANDLE ||
+      hEmaFast_TF2==INVALID_HANDLE || hEmaSlow_TF2==INVALID_HANDLE || hSmaSlow_TF2==INVALID_HANDLE)
    {
-      Print("Execution timeframe must be M1/M5/M15.");
-      SendTelegram("EA refused to start: invalid execution timeframe.");
+      Print("OnInit failed: indicator handle creation failed. err=", GetLastError());
       return INIT_FAILED;
    }
 
-   if(InpUseNewsFilter && StringLen(InpNewsSchedule) == 0)
-   {
-      Print("News filter enabled but no schedule provided.");
-      SendTelegram("News filter enabled but no schedule provided.");
-   }
+   trade.SetExpertMagicNumber(InpMagic);
 
-   g_atr_handle = iATR(Symbol(), InpExecTF, InpATRPeriod);
-   if(g_atr_handle == INVALID_HANDLE)
-   {
-      Print("Failed to create ATR handle.");
-      return INIT_FAILED;
-   }
+   ResetDailyIfNeeded();
+   Print("Initialized OK on ", _Symbol, " ExecTF=", InpExecTF);
 
-   g_rsi_handle = iRSI(Symbol(), InpExecTF, InpRSIPeriod, PRICE_CLOSE);
-   if(g_rsi_handle == INVALID_HANDLE)
-   {
-      Print("Failed to create RSI handle.");
-      IndicatorRelease(g_atr_handle);
-      return INIT_FAILED;
-   }
-
-   g_ema_fast_h1_handle = iMA(Symbol(), InpTrendTF1, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
-   g_ema_slow_h1_handle = iMA(Symbol(), InpTrendTF1, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
-   g_sma_slow_h1_handle = iMA(Symbol(), InpTrendTF1, InpSMASlow, 0, MODE_SMA, PRICE_CLOSE);
-   g_ema_fast_h4_handle = iMA(Symbol(), InpTrendTF2, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
-   g_ema_slow_h4_handle = iMA(Symbol(), InpTrendTF2, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
-   g_sma_slow_h4_handle = iMA(Symbol(), InpTrendTF2, InpSMASlow, 0, MODE_SMA, PRICE_CLOSE);
-
-   if(g_ema_fast_h1_handle == INVALID_HANDLE || g_ema_slow_h1_handle == INVALID_HANDLE ||
-      g_sma_slow_h1_handle == INVALID_HANDLE || g_ema_fast_h4_handle == INVALID_HANDLE ||
-      g_ema_slow_h4_handle == INVALID_HANDLE || g_sma_slow_h4_handle == INVALID_HANDLE)
-   {
-      Print("Failed to create MA handles.");
-      IndicatorRelease(g_atr_handle);
-      IndicatorRelease(g_rsi_handle);
-      if(g_ema_fast_h1_handle != INVALID_HANDLE)
-         IndicatorRelease(g_ema_fast_h1_handle);
-      if(g_ema_slow_h1_handle != INVALID_HANDLE)
-         IndicatorRelease(g_ema_slow_h1_handle);
-      if(g_sma_slow_h1_handle != INVALID_HANDLE)
-         IndicatorRelease(g_sma_slow_h1_handle);
-      if(g_ema_fast_h4_handle != INVALID_HANDLE)
-         IndicatorRelease(g_ema_fast_h4_handle);
-      if(g_ema_slow_h4_handle != INVALID_HANDLE)
-         IndicatorRelease(g_ema_slow_h4_handle);
-      if(g_sma_slow_h4_handle != INVALID_HANDLE)
-         IndicatorRelease(g_sma_slow_h4_handle);
-      return INIT_FAILED;
-   }
-
-   ResetDailyTracking();
-   EventSetTimer(60);
    return INIT_SUCCEEDED;
 }
 
-//+------------------------------------------------------------------+
-//| Expert deinitialization function                                 |
-//+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   EventKillTimer();
-   if(g_atr_handle != INVALID_HANDLE)
-      IndicatorRelease(g_atr_handle);
-   if(g_rsi_handle != INVALID_HANDLE)
-      IndicatorRelease(g_rsi_handle);
-   if(g_ema_fast_h1_handle != INVALID_HANDLE)
-      IndicatorRelease(g_ema_fast_h1_handle);
-   if(g_ema_slow_h1_handle != INVALID_HANDLE)
-      IndicatorRelease(g_ema_slow_h1_handle);
-   if(g_sma_slow_h1_handle != INVALID_HANDLE)
-      IndicatorRelease(g_sma_slow_h1_handle);
-   if(g_ema_fast_h4_handle != INVALID_HANDLE)
-      IndicatorRelease(g_ema_fast_h4_handle);
-   if(g_ema_slow_h4_handle != INVALID_HANDLE)
-      IndicatorRelease(g_ema_slow_h4_handle);
-   if(g_sma_slow_h4_handle != INVALID_HANDLE)
-      IndicatorRelease(g_sma_slow_h4_handle);
+   if(hATR!=INVALID_HANDLE) IndicatorRelease(hATR);
+   if(hRSI!=INVALID_HANDLE) IndicatorRelease(hRSI);
+
+   if(hEmaFast_TF1!=INVALID_HANDLE) IndicatorRelease(hEmaFast_TF1);
+   if(hEmaSlow_TF1!=INVALID_HANDLE) IndicatorRelease(hEmaSlow_TF1);
+   if(hSmaSlow_TF1!=INVALID_HANDLE) IndicatorRelease(hSmaSlow_TF1);
+
+   if(hEmaFast_TF2!=INVALID_HANDLE) IndicatorRelease(hEmaFast_TF2);
+   if(hEmaSlow_TF2!=INVALID_HANDLE) IndicatorRelease(hEmaSlow_TF2);
+   if(hSmaSlow_TF2!=INVALID_HANDLE) IndicatorRelease(hSmaSlow_TF2);
 }
 
-//+------------------------------------------------------------------+
-//| Timer for daily reset/summary                                    |
-//+------------------------------------------------------------------+
-void OnTimer()
-{
-   datetime today = CurrentDayStart();
-   if(today != g_day_start)
-   {
-      SendDailySummary();
-      ResetDailyTracking();
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Trade transaction for exit alerts                                |
-//+------------------------------------------------------------------+
-void OnTradeTransaction(const MqlTradeTransaction &trans,
-                        const MqlTradeRequest &request,
-                        const MqlTradeResult &result)
-{
-   if(trans.type == TRADE_TRANSACTION_DEAL_ADD &&
-      (trans.deal_type == DEAL_TYPE_SELL || trans.deal_type == DEAL_TYPE_BUY))
-   {
-      if(trans.deal > 0)
-      {
-         long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
-         if(entry != DEAL_ENTRY_OUT)
-            return;
-
-         string deal_symbol = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
-         double deal_price = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
-         double deal_profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
-         string msg = StringFormat("Exit %s at %.2f, P/L=%.2f",
-                                   deal_symbol, deal_price, deal_profit);
-         SendTelegram(msg);
-      }
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Expert tick function                                             |
-//+------------------------------------------------------------------+
 void OnTick()
 {
-   if(!g_trading_enabled)
-      return;
+   if(!SymbolMatchesLock()) return;
 
-   if(!DailyDrawdownOK())
-   {
-      g_trading_enabled = false;
-      SendTelegram("Trading halted: daily drawdown exceeded.");
-      return;
-   }
+   // Only evaluate once per new bar on ExecTF (more stable than tick-by-tick spam)
+   if(!IsNewBar()) return;
 
-   if(HasOpenPosition())
-      return;
-
-   if(!SpreadOK() || !SlippageOK() || !SessionOK())
-      return;
-
-   datetime next_news_time;
-   if(!NewsOK(next_news_time))
-   {
-      SendTelegram("Trading paused for high-impact USD news.");
-      return;
-   }
-
-   bool bullish = false;
-   if(!TrendAligned(bullish))
-      return;
-
-   double atr;
-   if(!VolatilityOK(atr))
-      return;
-
-   if(!MomentumOK(bullish))
-      return;
-
-   if(!PriceActionOK(bullish))
-      return;
-
-   double sl_points = (atr * InpATRSLMult) / SymbolInfoDouble(Symbol(), SYMBOL_POINT);
-   double tp_points = (atr * InpATRTPMult) / SymbolInfoDouble(Symbol(), SYMBOL_POINT);
-
-   double lot = CalcLot(sl_points);
-   if(lot <= 0.0)
-      return;
-
-   // Enforce max loss and min TP in USD by recalculating monetary value
-   double tick_value = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_VALUE);
-   double tick_size = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_SIZE);
-   double point_value = tick_value / tick_size;
-
-   double sl_usd = sl_points * point_value * lot;
-   double tp_usd = tp_points * point_value * lot;
-   if(sl_usd > InpMaxLossPerTradeUSD + 0.01)
-      return;
-   if(tp_usd < InpMinTakeProfitUSD)
-      return;
-
-   double price = bullish ? SymbolInfoDouble(Symbol(), SYMBOL_ASK) : SymbolInfoDouble(Symbol(), SYMBOL_BID);
-   double sl = bullish ? price - sl_points * SymbolInfoDouble(Symbol(), SYMBOL_POINT)
-                       : price + sl_points * SymbolInfoDouble(Symbol(), SYMBOL_POINT);
-   double tp = bullish ? price + tp_points * SymbolInfoDouble(Symbol(), SYMBOL_POINT)
-                       : price - tp_points * SymbolInfoDouble(Symbol(), SYMBOL_POINT);
-
-   trade.SetDeviationInPoints(InpMaxSlippagePoints);
-   bool sent = false;
-
-   if(bullish)
-      sent = trade.Buy(lot, Symbol(), price, sl, tp, "XAUUSD bullish entry");
-   else
-      sent = trade.Sell(lot, Symbol(), price, sl, tp, "XAUUSD bearish entry");
-
-   if(sent)
-   {
-      string side = bullish ? "BUY" : "SELL";
-      string msg = StringFormat("Entry %s at %.2f SL %.2f TP %.2f Lot %.2f",
-                                side, price, sl, tp, lot);
-      SendTelegram(msg);
-   }
-   else
-   {
-      Print("Order send failed: ", GetLastError());
-   }
+   TryEnter();
 }
 //+------------------------------------------------------------------+
